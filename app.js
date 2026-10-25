@@ -47,6 +47,7 @@ function initialViewFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const view = params.get("view") || window.location.hash.replace(/^#/, "");
   if (params.has("date") && view && view !== "home" && view !== "archive") return "home";
+  if (view === "shorts") return "home";
   return VALID_VIEWS.has(view) ? view : "home";
 }
 
@@ -88,7 +89,6 @@ let shortHistoryExpiryTimer = null;
 let playerWheelLocked = false;
 let playerWheelDelta = 0;
 let playerWheelResetTimer = null;
-let touchStartY = null;
 let floatingPopup = null;
 let floatingPipWindow = null;
 let floatingPlayer = null;
@@ -636,7 +636,7 @@ function floatingSize(video) {
 function youtubeOrigin() {
   return window.location.origin && window.location.origin !== "null"
     ? window.location.origin
-    : "https://developerjillur.github.io";
+    : "https://iniel.github.io";
 }
 
 function youtubeWidgetReferrer() {
@@ -1457,7 +1457,6 @@ function shortCard(video) {
 function toolbar() {
   const options = [
     ["home", "All"],
-    ["shorts", "Shorts"],
     ["long", "Long videos"],
     ["liked", "Liked"],
     ["history", "Watch history"],
@@ -1639,7 +1638,7 @@ function settingsChangeSummary(draft) {
 }
 
 function repositoryIssuesNewUrl() {
-  const fallback = "https://github.com/developerjillur/nexafeed";
+  const fallback = "https://github.com/iniel/YourTube";
   const raw = String(state.feed?.repositoryUrl || fallback).trim().replace(/\/+$/, "");
   try {
     const url = new URL(raw);
@@ -1816,7 +1815,7 @@ function feedView() {
   const shortsSection = shorts.length && state.view !== "long"
     ? `<section class="section">
         <div class="section-head">
-          <div class="section-title"><span class="section-icon">ϟ</span><div><p class="eyebrow">${state.view === "liked" ? "Saved Shorts" : state.view === "ignored" ? "Skipped Shorts" : "Vertical playlist"}</p><h1>${shortsTitle}</h1></div></div>
+          <div class="section-title"><span class="section-icon">ϟ</span><div><p class="eyebrow">${state.view === "liked" ? "Saved Shorts" : state.view === "ignored" ? "Skipped Shorts" : "Shorts"}</p><h1>${shortsTitle}</h1></div></div>
           <span>${shorts.length} videos</span>
         </div>
         <div class="short-carousel">
@@ -2351,11 +2350,8 @@ function pruneWatchedShortQueue(keepVideoId) {
 function openShort(video, { allowHiddenRequested = false } = {}) {
   clearShortHistoryExpiryTimer();
   state.shortHistory.reset();
-  state.shortQueue = shortPlaybackQueue(video, { allowHiddenRequested });
-  if (!state.shortQueue.length) {
-    window.alert("All available Shorts are already watched. Clear Watch history if you want to replay them.");
-    return;
-  }
+  if (!video) return;
+  state.shortQueue = [video];
   state.shortIndex = 0;
   state.shortPanel = null;
   renderShort();
@@ -2376,8 +2372,6 @@ function renderShort() {
         <div class="short-shell" data-video-context-id="${escapeHtml(video.id)}">
           <div class="short-player">
             <div id="shortYoutubePlayer"></div>
-            <button class="wheel-capture-overlay" type="button" data-wheel-capture="short" data-wheel-side="left" tabindex="-1" aria-label="Scroll on the left Short edge to switch Shorts. Click to pause or resume."></button>
-            <button class="wheel-capture-overlay" type="button" data-wheel-capture="short" data-wheel-side="right" tabindex="-1" aria-label="Scroll on the right Short edge to switch Shorts. Click to pause or resume."></button>
           </div>
           <div class="short-action-stack">
             <button id="shortLikeButton" class="short-like ${liked ? "active" : ""}" aria-label="Save this Short to local likes" aria-pressed="${liked}"><span>${liked ? "♥" : "♡"}</span><small data-default-label="${escapeHtml(likeLabel)}">${liked ? "Liked" : escapeHtml(likeLabel)}</small></button>
@@ -2391,15 +2385,12 @@ function renderShort() {
           </div>
           <aside id="shortDrawer" class="short-drawer ${state.shortPanel ? "open" : ""}">${state.shortPanel ? shortDrawerContent(video) : ""}</aside>
         </div>
-        <div class="short-controls">
-          <button id="shortPrevious" aria-label="Previous Short" ${!canPreviousShort() ? "disabled" : ""}>↑</button>
-          <button id="shortNext" aria-label="Next Short" ${!canNextShort() ? "disabled" : ""}>↓</button>
-        </div>
       </div>
     </div>`;
-  bindWheelCaptureOverlay("short", handleShortWheel);
   createYoutubePlayer("shortYoutubePlayer", video, {
-    onEnded: nextShort,
+    onEnded() {
+      finalizeVideoBeforeLeaving(video, { reason: "short-ended" });
+    },
     onError() {
       state.unavailableVideos.add(video.id);
       setTimeout(() => {
@@ -2539,10 +2530,11 @@ function openInitialPlaybackRequest() {
   if (!request?.videoId) return false;
   const video = state.feed?.items?.find((item) => item.id === request.videoId);
   if (!video || (request.type && request.type !== video.type)) return false;
+  const requestView = request.view === "shorts" ? "home" : request.view;
   const hasExplicitArchiveDate = new URLSearchParams(window.location.search).has("date");
-  const requestUsesDailyView = !request.view || request.view === "home" || request.view === "archive";
+  const requestUsesDailyView = !requestView || requestView === "home" || requestView === "archive";
   if (hasExplicitArchiveDate && !requestUsesDailyView) return false;
-  if (request.view && VALID_VIEWS.has(request.view)) state.view = request.view;
+  if (requestView && VALID_VIEWS.has(requestView)) state.view = requestView;
   if (requestUsesDailyView && !selectedDailyItems().some((item) => item.id === video.id)) {
     return false;
   }
@@ -3055,34 +3047,12 @@ overlayRoot.addEventListener("click", (event) => {
   if (event.target.closest("#shortDescriptionButton")) return toggleShortPanel("description");
   if (event.target.closest("#shortDrawerClose")) return toggleShortPanel(state.shortPanel);
 });
-overlayRoot.addEventListener("wheel", handleShortWheel, { passive: false });
-overlayRoot.addEventListener("touchstart", (event) => {
-  if (event.target.closest(".short-drawer, .short-action-stack")) {
-    touchStartY = null;
-    return;
-  }
-  touchStartY = event.touches[0]?.clientY ?? null;
-}, { passive: true });
-overlayRoot.addEventListener("touchend", (event) => {
-  if (touchStartY === null) return;
-  const distance = touchStartY - (event.changedTouches[0]?.clientY ?? touchStartY);
-  if (Math.abs(distance) > 45) distance > 0 ? nextShort() : previousShort();
-  touchStartY = null;
-}, { passive: true });
 window.addEventListener("keydown", (event) => {
   if (isTypingTarget(event.target) || event.metaKey || event.ctrlKey || event.altKey) return;
   if (state.shortQueue.length) {
     if (event.key === "Escape") {
       event.preventDefault();
       closeShort();
-    }
-    if (event.key === "ArrowDown" || event.key === "ArrowRight" || event.key.toLowerCase() === "n") {
-      event.preventDefault();
-      nextShort();
-    }
-    if (event.key === "ArrowUp" || event.key === "ArrowLeft" || event.key.toLowerCase() === "p") {
-      event.preventDefault();
-      previousShort();
     }
     return;
   }

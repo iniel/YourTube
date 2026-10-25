@@ -131,7 +131,10 @@ test.describe('post-review hardening regressions', () => {
     await expect(page.locator('#archiveDateInput')).toHaveValue('2026-08-20');
 
     await page.goto(`${BASE}?play=00kEcNby86c&type=short&view=shorts&date=2026-08-20`, { waitUntil: 'domcontentloaded' });
-    await expect(page.locator('.short-shell')).toHaveCount(0);
+    await expect(page.locator('.short-shell')).toHaveAttribute('data-video-context-id', '00kEcNby86c');
+    await expect(page.locator('#shortNext, #shortPrevious')).toHaveCount(0);
+    await expect(page.locator('#mainNav [data-view="home"]')).toHaveClass(/active/);
+    await page.keyboard.press('Escape');
     await expect(page.locator('#archiveDateInput')).toHaveValue('2026-08-20');
 
     await page.goto(`${BASE}?play=Ut0i-SSEXY4&type=long&view=home`, { waitUntil: 'domcontentloaded' });
@@ -685,4 +688,58 @@ test.describe('post-review hardening regressions', () => {
     await expect(page.locator('[data-player-nav="-1"]')).toBeDisabled();
     await context.close();
   });
+});
+
+test.describe('Shorts feed has no entry point and no swipe-through', () => {
+  const freezeClockAtFeedUpdate = (feedUpdatedAt) => {
+    const NativeDate = Date;
+    const fixed = new NativeDate(feedUpdatedAt).getTime();
+    window.Date = class extends NativeDate {
+      constructor(...args) { super(...(args.length ? args : [fixed])); }
+      static now() { return fixed; }
+    };
+    localStorage.clear();
+  };
+
+  test('Shorts nav entries are gone and old Shorts links land on Home', async ({ browser }) => {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    await context.addInitScript(freezeClockAtFeedUpdate, localFeed.updatedAt);
+    const page = await context.newPage();
+    for (const url of [`${QA_BASE}view=shorts`, `${BASE}#shorts`]) {
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      await expect(page.locator('#mainNav [data-view="home"]')).toHaveClass(/active/);
+      await expect(page.locator('[data-view="shorts"]')).toHaveCount(0);
+    }
+    await context.close();
+  });
+
+  for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+    test(`${viewport.width}x${viewport.height} a Short plays alone and cannot be swiped, scrolled, or keyed to another Short`, async ({ browser }) => {
+      const context = await browser.newContext({ viewport, hasTouch: viewport.width < 600 });
+      await context.addInitScript(freezeClockAtFeedUpdate, localFeed.updatedAt);
+      const page = await context.newPage();
+      await page.goto(QA_BASE, { waitUntil: 'domcontentloaded' });
+      const firstShortId = await page.locator('.card-open[data-short-id]').first().getAttribute('data-short-id');
+      await openFirstShort(page);
+      const shell = page.locator('.short-shell');
+      await expect(shell).toHaveAttribute('data-video-context-id', firstShortId);
+      await expect(page.locator('#shortNext, #shortPrevious, [data-wheel-capture="short"]')).toHaveCount(0);
+
+      await page.keyboard.press('ArrowDown');
+      await page.keyboard.press('n');
+      await page.mouse.move(viewport.width / 2, viewport.height / 2);
+      await page.mouse.wheel(0, 1200);
+      await page.locator('#shortOverlay').dispatchEvent('touchstart', { touches: [{ identifier: 0, clientX: 100, clientY: 600 }] });
+      await page.locator('#shortOverlay').dispatchEvent('touchend', { changedTouches: [{ identifier: 0, clientX: 100, clientY: 100 }] });
+      await page.waitForTimeout(800);
+      await expect(page.locator('#shortOverlay')).toHaveCount(1);
+      await expect(shell).toHaveAttribute('data-video-context-id', firstShortId);
+      const ignored = await page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('nexafeed-ignored-v1') || '{}')));
+      expect(ignored).not.toContain(firstShortId);
+
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#shortOverlay')).toHaveCount(0);
+      await context.close();
+    });
+  }
 });

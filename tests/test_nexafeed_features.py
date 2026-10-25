@@ -481,10 +481,10 @@ class FrontendFeatureTests(unittest.TestCase):
             "state.shortHistory.nextExpiryAt(current.id, isPlayableShortId)",
             "function shortQueueForTransientTarget",
             "function refreshShortNavigationControls",
-            "!canPreviousShort() ? \"disabled\" : \"\"",
-            "!canNextShort() ? \"disabled\" : \"\"",
         ]:
             self.assertIn(marker, app_js)
+        self.assertNotIn('id="shortNext"', app_js)
+        self.assertNotIn('id="shortPrevious"', app_js)
         self.assertNotIn("recentShortHistory", app_js)
         self.assertNotIn("rememberRecentShortVideo", app_js)
         self.assertNotIn("recentShortBacktrackVideo", app_js)
@@ -584,16 +584,15 @@ class FrontendFeatureTests(unittest.TestCase):
             "function handlePlayerWheel",
             "function handleShortWheel",
             'data-wheel-capture="long"',
-            'data-wheel-capture="short"',
             'data-wheel-side="left"',
             'data-wheel-side="right"',
             'bindWheelCaptureOverlay("long", handlePlayerWheel)',
-            'bindWheelCaptureOverlay("short", handleShortWheel)',
             'event.target.closest("[data-wheel-capture]")',
             "Scroll on the left video edge",
-            "Scroll on the right Short edge",
         ]:
             self.assertIn(marker, app_js)
+        self.assertNotIn('bindWheelCaptureOverlay("short", handleShortWheel)', app_js)
+        self.assertNotIn('overlayRoot.addEventListener("wheel"', app_js)
 
         for marker in [
             ".wheel-capture-overlay",
@@ -612,17 +611,10 @@ class FrontendFeatureTests(unittest.TestCase):
         style_css = (ROOT / "style.css").read_text(encoding="utf-8")
 
         self.assertEqual(app_js.count('data-wheel-capture="long"'), 2)
-        self.assertEqual(app_js.count('data-wheel-capture="short"'), 2)
-        self.assertEqual(app_js.count('data-wheel-side="left"'), 2)
-        self.assertEqual(app_js.count('data-wheel-side="right"'), 2)
+        self.assertEqual(app_js.count('data-wheel-capture="short"'), 0)
+        self.assertEqual(app_js.count('data-wheel-side="left"'), 1)
+        self.assertEqual(app_js.count('data-wheel-side="right"'), 1)
         self.assertIn("document.querySelectorAll(`[data-wheel-capture=", app_js)
-        for marker in [
-            'id="shortPrevious"',
-            'id="shortNext"',
-            'event.target.closest("#shortPrevious")',
-            'event.target.closest("#shortNext")',
-        ]:
-            self.assertIn(marker, app_js)
 
         overlay_rule = re.search(r"\.wheel-capture-overlay\s*\{(?P<body>.*?)\n\}", style_css, re.DOTALL)
         self.assertIsNotNone(overlay_rule)
@@ -734,7 +726,7 @@ class FrontendFeatureTests(unittest.TestCase):
             "return buildShortPlaybackQueue({",
             "const selectedVideo = allShorts.find((item) => item.id === video?.id);",
             "const currentAfterPrune = state.shortQueue[state.shortIndex];",
-            "All available Shorts are already watched",
+            "state.shortQueue = [video];",
             "return playableLongVideos().filter((item) => item.id === currentId || (!isWatched(item.id) && !isIgnored(item.id)));",
             "readJson(PROGRESS_KEY, {})[videoId]",
             "playerWheelDelta",
