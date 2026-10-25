@@ -33,6 +33,7 @@ const API_KEY_KEY = "yourtube-api-key-v1";
 const SUBSCRIPTIONS_KEY = "yourtube-subscriptions-v1";
 const LOCAL_FEED_KEY = "yourtube-local-feed-v1";
 const LOCAL_FEED_STALE_MS = 60 * 60 * 1000;
+const SERVICE_WORKER_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
 const NOTEBOOKLM_NEW_NOTEBOOK_URL = "https://notebooklm.google.com/notebook/new";
 const GEMINI_CHAT_URL = "https://gemini.google.com/app";
 const GEMINI_VIDEO_PROMPT = "For this video, give me a full A to Z summary with topic-by-topic transcription from beginning to end.";
@@ -3264,4 +3265,55 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+let reloadOnControllerChange = false;
+
+function showUpdateBanner(worker) {
+  let banner = document.querySelector("#updateBanner");
+  if (!banner) {
+    banner = document.createElement("button");
+    banner.id = "updateBanner";
+    banner.type = "button";
+    banner.className = "update-banner";
+    banner.innerHTML = '<i aria-hidden="true"></i><span>New version — tap to update</span>';
+    document.body.append(banner);
+  }
+  banner.onclick = () => {
+    reloadOnControllerChange = true;
+    banner.disabled = true;
+    worker.postMessage({ type: "SKIP_WAITING" });
+  };
+}
+
+function watchForWaitingWorker(registration) {
+  if (registration.waiting && navigator.serviceWorker.controller) showUpdateBanner(registration.waiting);
+  registration.addEventListener("updatefound", () => {
+    const worker = registration.installing;
+    if (!worker) return;
+    worker.addEventListener("statechange", () => {
+      if (worker.state === "installed" && navigator.serviceWorker.controller) showUpdateBanner(worker);
+    });
+  });
+}
+
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator) || location.protocol === "file:") return;
+  // The first install also fires controllerchange via clients.claim(); only reload after the user asked for the update.
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!reloadOnControllerChange) return;
+    reloadOnControllerChange = false;
+    location.reload();
+  });
+  try {
+    const registration = await navigator.serviceWorker.register("./sw.js");
+    watchForWaitingWorker(registration);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") registration.update().catch(() => {});
+    });
+    setInterval(() => registration.update().catch(() => {}), SERVICE_WORKER_UPDATE_INTERVAL_MS);
+  } catch (error) {
+    console.warn("Service worker registration failed", error);
+  }
+}
+
+registerServiceWorker();
 loadFeed();

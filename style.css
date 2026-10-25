@@ -1247,6 +1247,33 @@ body.sidebar-collapsed .content { margin-left: 0; }
 .loading-grid i { aspect-ratio: 16/9; border-radius: 13px; background: linear-gradient(110deg,var(--surface) 8%,var(--surface-2) 18%,var(--surface) 33%); background-size: 200% 100%; animation: shine 1.4s linear infinite; }
 @keyframes shine { to { background-position-x: -200%; } }
 .scrim { display: none; }
+.update-banner {
+  position: fixed;
+  z-index: 150;
+  top: calc(env(safe-area-inset-top, 0px) + 76px);
+  left: 50%;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  max-width: min(360px, calc(100vw - 128px));
+  min-height: 40px;
+  padding: 0 16px 0 14px;
+  cursor: pointer;
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--red) 38%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  backdrop-filter: blur(14px);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 750;
+  box-shadow: 0 12px 38px rgba(0,0,0,.28);
+}
+.update-banner i { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 4px color-mix(in srgb, var(--red) 16%, transparent); }
+.update-banner span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.update-banner:hover { background: var(--hover); }
+.update-banner:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
+.update-banner:disabled { cursor: progress; opacity: .7; }
 
 @media (max-width: 1100px) {
   .short-drawer.open { width: min(300px, 27vw); min-width: min(300px, 27vw); }

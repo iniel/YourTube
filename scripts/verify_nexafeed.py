@@ -54,6 +54,7 @@ required_files = [
     "local-feed.mjs",
     "float.html",
     "config.json",
+    "sw.js",
     ".env.example",
     ".github/workflows/deploy-pages.yml",
     ".github/workflows/apply-feed-settings.yml",
@@ -294,9 +295,11 @@ for workflow_name, workflow in {
     "apply-feed-settings.yml": settings_workflow,
     "update-feed.yml": update_workflow,
 }.items():
-    for module in ["daily-archive.mjs", "local-feed.mjs"]:
+    for module in ["daily-archive.mjs", "local-feed.mjs", "sw.js"]:
         if module not in workflow:
             fail(f"{workflow_name} deployment artifact omits {module}")
+    if 'sed -i "s/__BUILD_VERSION__/${SHELL_VERSION}/" _site/sw.js' not in workflow:
+        fail(f"{workflow_name} does not stamp the service worker version")
     if "_site/data" in workflow:
         fail(f"{workflow_name} must not publish feed data to Pages")
     for match in re.finditer(r"uses:\s+([^\s#]+)", workflow):

@@ -820,3 +820,63 @@ test.describe('local feed from private subscriptions', () => {
     await context.close();
   });
 });
+
+test.describe('app update prompt', () => {
+  // Playwright routing never sees the browser's own service worker script fetch, so serve the app from a server whose sw.js bytes the test controls.
+  async function startAppServer() {
+    const http = require('http');
+    const fs = require('fs');
+    const path = require('path');
+    const root = path.resolve(__dirname, '..');
+    const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
+    const server = { swVersion: '__BUILD_VERSION__' };
+    server.http = http.createServer((request, response) => {
+      const pathname = decodeURIComponent(new URL(request.url, 'http://local').pathname);
+      const file = path.join(root, pathname.endsWith('/') ? `${pathname}index.html` : pathname);
+      if (!file.startsWith(root) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+        response.writeHead(404).end();
+        return;
+      }
+      let body = fs.readFileSync(file);
+      if (pathname === '/sw.js') body = body.toString().replace('__BUILD_VERSION__', server.swVersion);
+      response.writeHead(200, { 'content-type': types[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-cache' }).end(body);
+    });
+    await new Promise((resolve) => server.http.listen(0, '127.0.0.1', resolve));
+    server.url = `http://127.0.0.1:${server.http.address().port}/`;
+    return server;
+  }
+
+  test('a changed service worker shows the update banner and tapping it reloads into the new version', async ({ browser }) => {
+    const server = await startAppServer();
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    await context.route('https://www.youtube.com/iframe_api', (route) => route.abort());
+    const page = await context.newPage();
+    try {
+      await page.goto(server.url, { waitUntil: 'domcontentloaded' });
+      await page.evaluate(async () => {
+        await navigator.serviceWorker.ready;
+        if (!navigator.serviceWorker.controller) {
+          await new Promise((resolve) => navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true }));
+        }
+      });
+      await expect(page.locator('#updateBanner')).toHaveCount(0);
+
+      server.swVersion = 'next-build';
+      await page.evaluate(async () => (await navigator.serviceWorker.getRegistration()).update());
+
+      const banner = page.locator('#updateBanner');
+      await expect(banner).toHaveText('New version — tap to update');
+      const box = await banner.boundingBox();
+      expect(box.y).toBeGreaterThanOrEqual(64);
+      expect(box.x).toBeGreaterThanOrEqual(54);
+      expect(box.x + box.width).toBeLessThanOrEqual(390 - 54);
+
+      await Promise.all([page.waitForEvent('load'), banner.click()]);
+      await expect(page.locator('#updateBanner')).toHaveCount(0);
+      await expect.poll(() => page.evaluate(() => caches.keys())).toEqual(['yourtube-shell-next-build']);
+    } finally {
+      await context.close();
+      server.http.close();
+    }
+  });
+});

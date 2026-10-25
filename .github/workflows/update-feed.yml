@@ -140,7 +140,9 @@ jobs:
       - name: Prepare updated static site
         run: |
           mkdir _site
-          cp index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs local-feed.mjs float.html config.json _site/
+          cp index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs local-feed.mjs float.html config.json sw.js _site/
+          SHELL_VERSION="$(cd _site && cat index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs local-feed.mjs float.html config.json sw.js | sha256sum | cut -c1-16)"
+          sed -i "s/__BUILD_VERSION__/${SHELL_VERSION}/" _site/sw.js
           if [ -d docs ]; then cp -R docs _site/docs; fi
           touch _site/.nojekyll
 

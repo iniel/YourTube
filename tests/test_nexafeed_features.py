@@ -362,6 +362,24 @@ class FrontendFeatureTests(unittest.TestCase):
         for module in ['"short-history.mjs"', '"video-actions.mjs"', '"daily-archive.mjs"', '"local-feed.mjs"']:
             self.assertIn(module, verifier)
 
+    def test_service_worker_update_prompt_is_wired(self):
+        app_js = (ROOT / "app.js").read_text(encoding="utf-8")
+        sw_js = (ROOT / "sw.js").read_text(encoding="utf-8")
+        style_css = (ROOT / "style.css").read_text(encoding="utf-8")
+        verifier = (ROOT / "scripts/verify_nexafeed.py").read_text(encoding="utf-8")
+        for marker in ['const BUILD_VERSION = "__BUILD_VERSION__";', 'event.data?.type === "SKIP_WAITING"', "self.clients.claim()", 'cache: "reload"']:
+            self.assertIn(marker, sw_js)
+        self.assertEqual(sw_js.count("skipWaiting()"), 1)
+        for marker in ['navigator.serviceWorker.register("./sw.js")', 'postMessage({ type: "SKIP_WAITING" })', "New version — tap to update", "reloadOnControllerChange", "document.body.append(banner)"]:
+            self.assertIn(marker, app_js)
+        self.assertIn(".update-banner", style_css)
+        self.assertIn("safe-area-inset-top", style_css)
+        self.assertIn('"sw.js"', verifier)
+        for name in ["deploy-pages.yml", "update-feed.yml", "apply-feed-settings.yml"]:
+            workflow = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            self.assertIn("float.html config.json sw.js _site/", workflow)
+            self.assertIn('sed -i "s/__BUILD_VERSION__/${SHELL_VERSION}/" _site/sw.js', workflow)
+
     def test_external_video_surfaces_popup_and_backtrack_are_hardened(self):
         app_js = (ROOT / "app.js").read_text(encoding="utf-8")
         float_html = (ROOT / "float.html").read_text(encoding="utf-8")
@@ -990,7 +1008,8 @@ class EnvironmentConfigTests(unittest.TestCase):
         for email_secret in ["RESEND_API_KEY", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST", "NEXAFEED_EMAIL_RECIPIENTS"]:
             self.assertNotIn(email_secret, update_workflow)
         for workflow in [update_workflow, deploy_workflow, settings_workflow]:
-            self.assertIn("cp index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs local-feed.mjs float.html config.json _site/", workflow)
+            self.assertIn("cp index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs local-feed.mjs float.html config.json sw.js _site/", workflow)
+            self.assertIn('sed -i "s/__BUILD_VERSION__/${SHELL_VERSION}/" _site/sw.js', workflow)
             self.assertNotIn("_site/data", workflow)
             for match in re.finditer(r"uses:\s+([^\s#]+)", workflow):
                 self.assertRegex(match.group(1), r"@[0-9a-f]{40}$")
