@@ -743,3 +743,80 @@ test.describe('Shorts feed has no entry point and no swipe-through', () => {
     });
   }
 });
+
+test.describe('local feed from private subscriptions', () => {
+  const SUBSCRIPTIONS_CSV = 'Channel ID,Channel URL,Channel title\n'
+    + 'UCaaaaaaaaaaaaaaaaaaaaaa,http://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa,Alpha Channel\n';
+
+  async function routeYouTubeApi(context, calls) {
+    const publishedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const videos = {
+      longAaaaaaa: { duration: 'PT10M', playlist: 'UULF' },
+      shrtAaaaaaa: { duration: 'PT30S', playlist: 'UUSH' },
+    };
+    await context.route('https://www.googleapis.com/youtube/v3/**', (route) => {
+      const url = new URL(route.request().url());
+      calls.push(url.pathname);
+      if (url.pathname.endsWith('/playlistItems')) {
+        const prefix = url.searchParams.get('playlistId').slice(0, 4);
+        const items = Object.entries(videos).filter(([, video]) => video.playlist === prefix).map(([videoId]) => ({ contentDetails: { videoId } }));
+        return route.fulfill({ json: { items } });
+      }
+      const items = url.searchParams.get('id').split(',').map((id) => ({
+        id,
+        snippet: { title: `Video ${id}`, channelTitle: 'Alpha Channel', publishedAt, liveBroadcastContent: 'none', thumbnails: {} },
+        contentDetails: { duration: videos[id].duration },
+        statistics: { viewCount: '10' },
+        status: { embeddable: true },
+      }));
+      return route.fulfill({ json: { items } });
+    });
+  }
+
+  test('first run uploads subscriptions, refreshes through the API, and reloads from local storage', async ({ browser }) => {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    await context.addInitScript(() => { if (!sessionStorage.getItem('seeded')) { localStorage.clear(); sessionStorage.setItem('seeded', '1'); } });
+    await context.route('**/data/*.json?*', (route) => route.fulfill({ status: 404, body: '' }));
+    const calls = [];
+    await routeYouTubeApi(context, calls);
+    const page = await context.newPage();
+    await page.goto(BASE, { waitUntil: 'domcontentloaded' });
+
+    await expect(page.locator('#localSources')).toBeVisible();
+    await page.locator('#subscriptionsFile').setInputFiles({ name: 'subscriptions.csv', mimeType: 'text/csv', buffer: Buffer.from(SUBSCRIPTIONS_CSV) });
+    await expect(page.locator('#localSources')).toContainText('1 channels');
+    await page.locator('#localApiKey').fill('test-key');
+    await page.locator('#saveLocalApiKey').click();
+    await expect(page.locator('#localApiKey')).toHaveAttribute('placeholder', /ending in -key/);
+    await page.locator('#refreshLocalFeed').click();
+
+    await expect(page.locator('[data-short-id="shrtAaaaaaa"]')).toBeVisible();
+    await expect(page.locator('[data-video-id="longAaaaaaa"]').first()).toBeVisible();
+    await page.locator('.card-open[data-short-id="shrtAaaaaaa"]').click();
+    await expect(page.locator('.short-shell')).toHaveAttribute('data-video-context-id', 'shrtAaaaaaa');
+    await page.keyboard.press('Escape');
+
+    const callsBeforeReload = calls.length;
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.locator('[data-short-id="shrtAaaaaaa"]')).toBeVisible();
+    expect(calls.length).toBe(callsBeforeReload);
+    await context.close();
+  });
+
+  test('a rejected API key is reported without losing the stored subscriptions', async ({ browser }) => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    await context.addInitScript(() => {
+      localStorage.clear();
+      localStorage.setItem('yourtube-api-key-v1', 'bad-key');
+      localStorage.setItem('yourtube-subscriptions-v1', JSON.stringify([{ channelId: 'UCaaaaaaaaaaaaaaaaaaaaaa', title: 'Alpha Channel' }]));
+    });
+    await context.route('**/data/*.json?*', (route) => route.fulfill({ status: 404, body: '' }));
+    await context.route('https://www.googleapis.com/youtube/v3/**', (route) => route.fulfill({ status: 403, json: { error: { message: 'Requests from referer are blocked.' } } }));
+    const page = await context.newPage();
+    await page.goto(BASE, { waitUntil: 'domcontentloaded' });
+    await page.locator('#refreshLocalFeed').click();
+    await expect(page.locator('#localRefreshStatus')).toContainText('YouTube rejected the API key: Requests from referer are blocked.');
+    await expect(page.locator('#localSources')).toContainText('1 channels');
+    await context.close();
+  });
+});

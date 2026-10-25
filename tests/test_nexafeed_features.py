@@ -359,7 +359,7 @@ class FrontendFeatureTests(unittest.TestCase):
         self.assertNotIn('return window.location.href.split("#")[0];', app_js)
         self.assertIn("@media (max-width: 680px) and (max-height: 780px)", style_css)
         self.assertIn("overflow-y: auto", style_css)
-        for module in ['"short-history.mjs"', '"video-actions.mjs"', '"daily-archive.mjs"']:
+        for module in ['"short-history.mjs"', '"video-actions.mjs"', '"daily-archive.mjs"', '"local-feed.mjs"']:
             self.assertIn(module, verifier)
 
     def test_external_video_surfaces_popup_and_backtrack_are_hardened(self):
@@ -488,6 +488,86 @@ class FrontendFeatureTests(unittest.TestCase):
         self.assertNotIn("recentShortHistory", app_js)
         self.assertNotIn("rememberRecentShortVideo", app_js)
         self.assertNotIn("recentShortBacktrackVideo", app_js)
+
+    def test_local_feed_builds_from_takeout_subscriptions_through_youtube_api(self):
+        module_url = json.dumps((ROOT / "local-feed.mjs").as_uri())
+        script = f"""
+          import {{ ApiKeyError, parseSubscriptionsCsv, refreshLocalFeed }} from {module_url};
+          const expect = (condition, message) => {{ if (!condition) throw new Error(message); }};
+          const csv = "\\uFEFFChannel ID,Channel URL,Channel title\\r\\n"
+            + "UCaaaaaaaaaaaaaaaaaaaaaa,http://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa,Александр Панчин\\r\\n"
+            + "UCbbbbbbbbbbbbbbbbbbbbbb,http://www.youtube.com/channel/UCbbbbbbbbbbbbbbbbbbbbbb,\\"Comma, Inc\\"\\r\\n"
+            + "UCaaaaaaaaaaaaaaaaaaaaaa,duplicate,Dup\\r\\nnot-a-channel,x,y\\r\\n\\r\\n";
+          const subscriptions = parseSubscriptionsCsv(csv);
+          expect(subscriptions.length === 2, "header, duplicates, and invalid IDs must be skipped");
+          expect(subscriptions[0].title === "Александр Панчин", "Cyrillic titles survive BOM stripping");
+          expect(subscriptions[1].title === "Comma, Inc", "quoted commas stay in the title");
+
+          const now = new Date("2026-08-20T00:00:00Z");
+          const requested = [];
+          const json = (status, body) => ({{ ok: status < 400, status, json: async () => body }});
+          const videos = {{
+            longA1aaaaa: {{ type: "long", duration: "PT12M5S", publishedAt: "2026-08-19T10:00:00Z", embeddable: true }},
+            shrtA1aaaaa: {{ type: "short", duration: "PT42S", publishedAt: "2026-08-19T11:00:00Z", embeddable: true }},
+            longB1bbbbb: {{ type: "long", duration: "PT1H2M3S", publishedAt: "2026-08-18T10:00:00Z", embeddable: false }},
+          }};
+          const fakeFetch = async (href) => {{
+            const url = new URL(href);
+            requested.push(url.pathname + "?" + url.searchParams.get("playlistId"));
+            expect(url.searchParams.get("key") === "test-key", "every request carries the API key");
+            if (url.pathname.endsWith("/playlistItems")) {{
+              const playlistId = url.searchParams.get("playlistId");
+              if (playlistId === "UUSHbbbbbbbbbbbbbbbbbbbbbb") return json(404, {{ error: {{ message: "playlistNotFound" }} }});
+              const prefix = playlistId.startsWith("UUSH") ? "shrt" : "long";
+              const channelLetter = playlistId.slice(-1).toUpperCase();
+              const items = Object.keys(videos).filter((id) => id.startsWith(prefix + channelLetter));
+              return json(200, {{ items: items.map((videoId) => ({{ contentDetails: {{ videoId }} }})) }});
+            }}
+            const ids = url.searchParams.get("id").split(",");
+            return json(200, {{ items: ids.map((id) => ({{
+              id,
+              snippet: {{ title: "Title " + id, channelTitle: "API title", publishedAt: videos[id].publishedAt, liveBroadcastContent: "none", thumbnails: {{}} }},
+              contentDetails: {{ duration: videos[id].duration }},
+              statistics: {{ viewCount: "1500" }},
+              status: {{ embeddable: videos[id].embeddable }},
+            }})) }});
+          }};
+          const stale = {{ id: "oldOld12345", type: "long", channelId: "UCaaaaaaaaaaaaaaaaaaaaaa", publishedAt: "2026-07-01T00:00:00Z" }};
+          const kept = {{ id: "keptKept123", type: "long", channelId: "UCaaaaaaaaaaaaaaaaaaaaaa", publishedAt: "2026-08-15T00:00:00Z" }};
+          const unsubscribed = {{ id: "goneGone123", type: "long", channelId: "UCzzzzzzzzzzzzzzzzzzzzzz", publishedAt: "2026-08-15T00:00:00Z" }};
+          const feed = await refreshLocalFeed({{
+            apiKey: "test-key", subscriptions, previousItems: [stale, kept, unsubscribed], fetchImpl: fakeFetch, now: () => now,
+          }});
+          const ids = feed.items.map((item) => item.id);
+          expect(feed.source === "local", "feed is marked local");
+          expect(ids.join(",") === "shrtA1aaaaa,longA1aaaaa,longB1bbbbb,keptKept123", "fresh items merge with retained items newest first: " + ids);
+          const short = feed.items.find((item) => item.id === "shrtA1aaaaa");
+          expect(short.type === "short" && short.durationSeconds === 42 && short.duration === "0:42", "Shorts come from the UUSH playlist with parsed duration");
+          expect(short.url === "https://www.youtube.com/watch?v=shrtA1aaaaa", "watch URL is canonical");
+          expect(short.channelUrl === "https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa", "channel URL uses the channel ID");
+          expect(short.firstSeenAt === short.publishedAt && short.views === "1.5K views", "archive date follows publish date");
+          expect(feed.items.find((item) => item.id === "longB1bbbbb").durationSeconds === 3723, "hours parse");
+          expect(feed.items.find((item) => item.id === "longB1bbbbb").embedAllowed === false, "non-embeddable flag is kept");
+          expect(feed.stats.shorts === 1 && feed.stats.longVideos === 3 && feed.stats.newThisRun === 3, "stats are counted");
+          expect(feed.health.failures.length === 0, "a missing Shorts playlist is not a failure");
+
+          let rejected = null;
+          try {{
+            await refreshLocalFeed({{ apiKey: "bad", subscriptions, fetchImpl: async () => json(403, {{ error: {{ message: "API key not valid" }} }}) }});
+          }} catch (error) {{ rejected = error; }}
+          expect(rejected instanceof ApiKeyError && rejected.message === "API key not valid", "403 surfaces as an API key error");
+
+          const partial = await refreshLocalFeed({{
+            apiKey: "test-key", subscriptions, now: () => now,
+            fetchImpl: async (href) => href.includes("bbbbbbbbbbbbbbbbbbbbbb")
+              ? json(500, {{ error: {{ message: "backend error" }} }})
+              : fakeFetch(href),
+          }});
+          expect(partial.health.failures.length === 1 && partial.health.failures[0].channel === "Comma, Inc", "one broken channel does not stop the refresh");
+          expect(partial.items.some((item) => item.id === "longA1aaaaa"), "healthy channels still load");
+        """
+        result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_watched_short_selected_from_history_opens_itself_and_can_be_backtracked(self):
         app_js = (ROOT / "app.js").read_text(encoding="utf-8")
@@ -910,7 +990,8 @@ class EnvironmentConfigTests(unittest.TestCase):
         for email_secret in ["RESEND_API_KEY", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST", "NEXAFEED_EMAIL_RECIPIENTS"]:
             self.assertNotIn(email_secret, update_workflow)
         for workflow in [update_workflow, deploy_workflow, settings_workflow]:
-            self.assertIn("cp index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs float.html config.json _site/", workflow)
+            self.assertIn("cp index.html style.css app.js short-history.mjs video-actions.mjs daily-archive.mjs local-feed.mjs float.html config.json _site/", workflow)
+            self.assertNotIn("_site/data", workflow)
             for match in re.finditer(r"uses:\s+([^\s#]+)", workflow):
                 self.assertRegex(match.group(1), r"@[0-9a-f]{40}$")
         self.assertIn("if [ -d docs ]; then cp -R docs _site/docs; fi", deploy_workflow)

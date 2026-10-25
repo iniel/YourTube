@@ -1,7 +1,6 @@
 import { buildShortPlaybackQueue, createTransientDirectionalHistory } from "./short-history.mjs?v=20260821-gemini-brief";
 import { buildPlaybackUrl, buildYouTubeChannelUrl, buildYouTubeWatchUrl, readPlaybackRequest } from "./video-actions.mjs?v=20260821-gemini-brief";
 import {
-  ARCHIVE_RETENTION_DAYS,
   ARCHIVE_TIME_ZONE,
   archiveDateOptions,
   archiveStateRetentionMs,
@@ -12,6 +11,7 @@ import {
   itemsForArchiveDate,
   resolveArchiveDate,
 } from "./daily-archive.mjs?v=20260821-gemini-brief";
+import { ApiKeyError, parseSubscriptionsCsv, refreshLocalFeed } from "./local-feed.mjs?v=20260821-gemini-brief";
 
 const app = document.querySelector("#app");
 const overlayRoot = document.querySelector("#overlayRoot");
@@ -29,6 +29,10 @@ const IGNORED_KEY = "nexafeed-ignored-v1";
 const THEME_KEY = "nexafeed-theme-v1";
 const AUTOPLAY_KEY = "nexafeed-autoplay-v1";
 const LIKED_KEY = "nexafeed-liked-v1";
+const API_KEY_KEY = "yourtube-api-key-v1";
+const SUBSCRIPTIONS_KEY = "yourtube-subscriptions-v1";
+const LOCAL_FEED_KEY = "yourtube-local-feed-v1";
+const LOCAL_FEED_STALE_MS = 60 * 60 * 1000;
 const NOTEBOOKLM_NEW_NOTEBOOK_URL = "https://notebooklm.google.com/notebook/new";
 const GEMINI_CHAT_URL = "https://gemini.google.com/app";
 const GEMINI_VIDEO_PROMPT = "For this video, give me a full A to Z summary with topic-by-topic transcription from beginning to end.";
@@ -42,6 +46,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_STATE_RETENTION_DAYS = 8;
 const VALID_VIEWS = new Set(["home", "shorts", "long", "liked", "history", "ignored", "archive", "settings"]);
 const VIDEO_ACTION_MENU_BLOCKED_SHORTCUTS = new Set(["ArrowLeft", "ArrowRight", "PageUp", "PageDown", "n", "N", "p", "P"]);
+
+function deviceTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || ARCHIVE_TIME_ZONE;
+}
+
+let archiveTimeZone = localStorage.getItem(SUBSCRIPTIONS_KEY) ? deviceTimeZone() : ARCHIVE_TIME_ZONE;
 
 function initialViewFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -59,7 +69,8 @@ const state = {
   view: initialViewFromUrl(),
   query: "",
   quickFilter: "all",
-  selectedDate: resolveArchiveDate(new URLSearchParams(window.location.search).get("date")),
+  selectedDate: resolveArchiveDate(new URLSearchParams(window.location.search).get("date"), { timeZone: archiveTimeZone }),
+  localRefresh: { running: false, done: 0, total: 0, error: "" },
   archiveExportStatus: "",
   watched: readJson(WATCHED_KEY, {}),
   progress: readJson(PROGRESS_KEY, {}),
@@ -1281,13 +1292,13 @@ function isDailyFeedView() {
 }
 
 function selectedDailyItems() {
-  return itemsForArchiveDate(state.feed?.items || [], state.selectedDate, ARCHIVE_TIME_ZONE);
+  return itemsForArchiveDate(state.feed?.items || [], state.selectedDate, archiveTimeZone);
 }
 
 function archiveDateLabel(dateKey) {
-  const date = new Date(`${dateKey}T12:00:00+06:00`);
+  const date = new Date(`${dateKey}T12:00:00Z`);
   return new Intl.DateTimeFormat("en", {
-    timeZone: ARCHIVE_TIME_ZONE,
+    timeZone: "UTC",
     weekday: "long",
     year: "numeric",
     month: "long",
@@ -1297,14 +1308,14 @@ function archiveDateLabel(dateKey) {
 
 function archiveQuickDateMarkup(dates) {
   return dates.slice(0, 7).map((dateKey, index) => {
-    const date = new Date(`${dateKey}T12:00:00+06:00`);
+    const date = new Date(`${dateKey}T12:00:00Z`);
     const label = index === 0
       ? "Today"
       : index === 1
         ? "Yesterday"
-        : new Intl.DateTimeFormat("en", { timeZone: ARCHIVE_TIME_ZONE, weekday: "short" }).format(date);
-    const day = new Intl.DateTimeFormat("en", { timeZone: ARCHIVE_TIME_ZONE, day: "2-digit" }).format(date);
-    const month = new Intl.DateTimeFormat("en", { timeZone: ARCHIVE_TIME_ZONE, month: "short" }).format(date);
+        : new Intl.DateTimeFormat("en", { timeZone: "UTC", weekday: "short" }).format(date);
+    const day = new Intl.DateTimeFormat("en", { timeZone: "UTC", day: "2-digit" }).format(date);
+    const month = new Intl.DateTimeFormat("en", { timeZone: "UTC", month: "short" }).format(date);
     return `
       <button type="button" class="archive-quick-date ${state.selectedDate === dateKey ? "active" : ""}" data-archive-date="${escapeHtml(dateKey)}" data-archive-quick-date="${escapeHtml(dateKey)}" aria-pressed="${state.selectedDate === dateKey ? "true" : "false"}" aria-label="Show videos collected on ${escapeHtml(archiveDateLabel(dateKey))}">
         <small>${escapeHtml(label)}</small><strong>${escapeHtml(day)}</strong><span>${escapeHtml(month)}</span>
@@ -1316,7 +1327,7 @@ function syncArchiveLocation() {
   const target = new URL(window.location.href);
   target.searchParams.delete("play");
   target.searchParams.delete("type");
-  const today = archiveDateOptions()[0];
+  const today = archiveDateOptions({ timeZone: archiveTimeZone })[0];
   if (isDailyFeedView() && state.selectedDate !== today) target.searchParams.set("date", state.selectedDate);
   else target.searchParams.delete("date");
   if (state.view === "archive") target.searchParams.set("view", "archive");
@@ -1326,7 +1337,7 @@ function syncArchiveLocation() {
 
 function selectArchiveDate(value) {
   finalizeVideoBeforeLeaving(state.activeVideo, { reason: "archive-date" });
-  state.selectedDate = resolveArchiveDate(value);
+  state.selectedDate = resolveArchiveDate(value, { timeZone: archiveTimeZone });
   state.archiveExportStatus = "";
   state.activeVideo = null;
   state.quickFilter = "all";
@@ -1338,7 +1349,7 @@ function selectArchiveDate(value) {
 
 function archiveDateToolbar() {
   if (!isDailyFeedView()) return "";
-  const dates = archiveDateOptions({ days: ARCHIVE_RETENTION_DAYS });
+  const dates = archiveDateOptions({ timeZone: archiveTimeZone });
   const index = Math.max(0, dates.indexOf(state.selectedDate));
   const newer = index > 0 ? dates[index - 1] : "";
   const older = index < dates.length - 1 ? dates[index + 1] : "";
@@ -1348,7 +1359,7 @@ function archiveDateToolbar() {
   return `
     <section class="daily-filter" data-archive-selected="${escapeHtml(state.selectedDate)}">
       <div class="daily-filter-copy">
-        <p class="eyebrow"><span class="archive-live-dot"></span>30-day Bangladesh archive</p>
+        <p class="eyebrow"><span class="archive-live-dot"></span>30-day archive</p>
         <h1>${escapeHtml(archiveDateLabel(state.selectedDate))}</h1>
         <span>${items.length} videos · ${longCount} long · ${shortCount} Shorts</span>
       </div>
@@ -1381,7 +1392,7 @@ function dailyExportPayload() {
     details: state.details,
     selectedDate: state.selectedDate,
     baseHref: window.location.href,
-    timeZone: ARCHIVE_TIME_ZONE,
+    timeZone: archiveTimeZone,
   });
 }
 
@@ -1680,13 +1691,42 @@ async function applyFeedSettings() {
   }
 }
 
+function historyToolsCard() {
+  return `
+      <article class="settings-card history-tools">
+        <h2>Watch-state backup</h2>
+        <p>History and ignored videos remain private to this browser. Export JSON to move watched/progress/ignored state to another browser or device.</p>
+        <small>Watched and ignored records are kept for the current feed window plus 1 extra day, so refreshed videos do not return as new while they are still in the feed.</small>
+        <div class="settings-actions">
+          <button id="exportHistory" class="action-button">Export history JSON</button>
+          <button id="importHistory" class="action-button">Import history JSON</button>
+          <button id="clearHistory" class="danger">Clear history</button>
+          <button id="clearIgnored" class="danger">Clear ignored</button>
+          <input id="historyFile" type="file" accept="application/json,.json" hidden>
+        </div>
+      </article>`;
+}
+
 function settingsView() {
+  if (isLocalMode()) {
+    return `
+    <section class="settings">
+      <div class="settings-hero">
+        <p class="eyebrow">Feed control</p>
+        <h1>Your private feed</h1>
+        <p>Videos come from your subscriptions through the YouTube Data API, straight from this browser.</p>
+      </div>
+      ${localSourcesCard()}
+      ${historyToolsCard()}
+    </section>`;
+  }
   const health = state.feed?.health || {};
   const secondary = health.secondary || {};
   if (!state.settingsDraft) state.settingsDraft = freshSettingsDraft();
   const draft = state.settingsDraft;
   return `
     <section class="settings">
+      ${localSourcesCard()}
       <div class="settings-hero">
         <p class="eyebrow">Feed control</p>
         <h1>Manage monitored channels and discovery</h1>
@@ -1726,18 +1766,7 @@ function settingsView() {
         <article class="settings-card"><strong>${escapeHtml(secondary.query || "Rotation idle")}</strong><h2>Latest discovery query</h2><p>Primary channels remain ranked first.</p></article>
         <article class="settings-card"><strong>${escapeHtml(state.feed?.stats?.newThisRun || 0)}</strong><h2>New this refresh</h2><p>Last refreshed ${escapeHtml(timeAgo(state.feed?.updatedAt))}.</p></article>
       </div>
-      <article class="settings-card history-tools">
-        <h2>Watch-state backup</h2>
-        <p>History and ignored videos remain private to this browser. Export JSON to move watched/progress/ignored state to another browser or device.</p>
-        <small>Watched and ignored records are kept for the current feed window plus 1 extra day, so refreshed videos do not return as new while they are still in the feed.</small>
-        <div class="settings-actions">
-          <button id="exportHistory" class="action-button">Export history JSON</button>
-          <button id="importHistory" class="action-button">Import history JSON</button>
-          <button id="clearHistory" class="danger">Clear history</button>
-          <button id="clearIgnored" class="danger">Clear ignored</button>
-          <input id="historyFile" type="file" accept="application/json,.json" hidden>
-        </div>
-      </article>
+      ${historyToolsCard()}
     </section>`;
 }
 
@@ -1796,7 +1825,7 @@ function feedView() {
         : state.view === "ignored"
         ? "Skip a running video before the watch threshold and it will stay hidden here until the feed-window retention expires or you clear ignored."
         : isDailyFeedView()
-          ? "Choose another date from the last 30 Bangladesh calendar days. Empty days remain selectable and export as an empty research pack."
+          ? "Choose another date from the last 30 calendar days. Empty days remain selectable and export as an empty research pack."
         : searchEmpty
           ? "Try a channel name, title keyword, topic, or category. Search updates live as you type."
           : "Watched and ignored videos stay hidden. New uploads will arrive on the next hourly refresh.";
@@ -1841,6 +1870,7 @@ function render() {
   setActiveNav();
   if (state.activeVideo) renderPlayer();
   else if (state.view === "settings") app.innerHTML = settingsView();
+  else if (isLocalMode() && !state.feed.items.length && !state.feed.updatedAt) app.innerHTML = localOnboardingView();
   else app.innerHTML = feedView();
 }
 
@@ -2653,8 +2683,43 @@ async function fetchJson(url, fallback = null) {
   }
 }
 
+function emptyLocalFeed() {
+  return { source: "local", updatedAt: "", items: [], stats: {}, health: {} };
+}
+
+function isLocalMode() {
+  return state.feed?.source === "local";
+}
+
+function applyFeed(feed, details = { items: {} }, feedSettings = { channels: [], keywords: [], topics: [], categories: [] }) {
+  state.feed = feed;
+  state.details = details;
+  state.feedSettings = feedSettings;
+  state.settingsDraft = null;
+  state.feed.items = Array.isArray(state.feed.items)
+    ? state.feed.items.filter((item) => item.embedAllowed !== false)
+    : [];
+  state.feed.items.sort((a, b) => {
+    if (a.source !== b.source) return a.source === "primary" ? -1 : 1;
+    if ((a.priority || 1) !== (b.priority || 1)) return (a.priority || 1) - (b.priority || 1);
+    return new Date(b.publishedAt) - new Date(a.publishedAt);
+  });
+  prunePlaybackStateRetention();
+  const updated = new Date(state.feed.updatedAt);
+  updatedLabel.innerHTML = Number.isFinite(updated.getTime())
+    ? `<i></i>Updated ${updated.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
+    : "<i></i>Waiting for first refresh";
+}
+
 async function loadFeed() {
   app.innerHTML = '<div class="loading-grid"><i></i><i></i><i></i></div>';
+  const storedLocalFeed = readJson(LOCAL_FEED_KEY, null);
+  if (Array.isArray(storedLocalFeed?.items)) {
+    applyFeed(storedLocalFeed);
+    if (!openInitialPlaybackRequest()) render();
+    if (Date.now() - new Date(storedLocalFeed.updatedAt).getTime() > LOCAL_FEED_STALE_MS) runLocalRefresh({ background: true });
+    return;
+  }
   try {
     const stamp = Date.now();
     const [feed, details, feedSettings] = await Promise.all([
@@ -2662,27 +2727,151 @@ async function loadFeed() {
       fetchJson(`data/video-details.json?time=${stamp}`, { items: {} }),
       fetchJson(`data/feed-settings.json?time=${stamp}`, { channels: [], keywords: [], topics: [], categories: [] }),
     ]);
-    state.feed = feed;
-    state.details = details;
-    state.feedSettings = feedSettings;
-    state.settingsDraft = null;
-    state.feed.items = Array.isArray(state.feed.items)
-      ? state.feed.items.filter((item) => item.embedAllowed !== false)
-      : [];
-    state.feed.items.sort((a, b) => {
-      if (a.source !== b.source) return a.source === "primary" ? -1 : 1;
-      if ((a.priority || 1) !== (b.priority || 1)) return (a.priority || 1) - (b.priority || 1);
-      return new Date(b.publishedAt) - new Date(a.publishedAt);
-    });
-    prunePlaybackStateRetention();
-    const updated = new Date(state.feed.updatedAt);
-    updatedLabel.innerHTML = Number.isFinite(updated.getTime())
-      ? `<i></i>Updated ${updated.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
-      : "<i></i>Waiting for first refresh";
-    if (!openInitialPlaybackRequest()) render();
+    applyFeed(feed, details, feedSettings);
   } catch {
-    app.innerHTML = emptyState("Feed could not load", "Run this website through GitHub Pages or a local web server. Opening index.html directly cannot load JSON in some browsers.");
+    applyFeed(emptyLocalFeed());
   }
+  if (!openInitialPlaybackRequest()) render();
+}
+
+function storedSubscriptions() {
+  const subscriptions = readJson(SUBSCRIPTIONS_KEY, []);
+  return Array.isArray(subscriptions) ? subscriptions : [];
+}
+
+function useDeviceTimeZone() {
+  if (archiveTimeZone === deviceTimeZone()) return;
+  archiveTimeZone = deviceTimeZone();
+  state.selectedDate = resolveArchiveDate("", { timeZone: archiveTimeZone });
+}
+
+function localRefreshStatusText() {
+  const refresh = state.localRefresh;
+  if (refresh.running) return `Refreshing… ${refresh.done}/${refresh.total} channels`;
+  if (refresh.error) return refresh.error;
+  const updated = new Date(state.feed?.updatedAt);
+  if (!isLocalMode() || !Number.isFinite(updated.getTime())) return "Not refreshed yet.";
+  return `Last refreshed ${timeAgo(state.feed.updatedAt)} · ${state.feed.stats?.longVideos || 0} long videos and ${state.feed.stats?.shorts || 0} Shorts.`;
+}
+
+function updateLocalRefreshStatus() {
+  const status = document.querySelector("#localRefreshStatus");
+  if (status) status.textContent = localRefreshStatusText();
+  document.querySelector("#refreshLocalFeed")?.toggleAttribute("disabled", state.localRefresh.running);
+}
+
+function playerIsOpen() {
+  return Boolean(state.activeVideo || state.shortQueue.length);
+}
+
+async function runLocalRefresh({ background = false } = {}) {
+  if (state.localRefresh.running) return;
+  const apiKey = localStorage.getItem(API_KEY_KEY) || "";
+  const subscriptions = storedSubscriptions();
+  if (!apiKey || !subscriptions.length) {
+    if (background) return;
+    state.localRefresh.error = "Add your YouTube API key and subscriptions.csv first.";
+    if (!playerIsOpen()) selectView("settings");
+    return;
+  }
+  useDeviceTimeZone();
+  state.localRefresh = { running: true, done: 0, total: subscriptions.length, error: "" };
+  updateLocalRefreshStatus();
+  try {
+    const feed = await refreshLocalFeed({
+      apiKey,
+      subscriptions,
+      previousItems: readJson(LOCAL_FEED_KEY, { items: [] }).items || [],
+      timeZone: archiveTimeZone,
+      onProgress({ done, total }) {
+        state.localRefresh.done = done;
+        state.localRefresh.total = total;
+        updateLocalRefreshStatus();
+      },
+    });
+    localStorage.setItem(LOCAL_FEED_KEY, JSON.stringify(feed));
+    state.localRefresh.running = false;
+    applyFeed(feed);
+  } catch (error) {
+    const reason = error instanceof ApiKeyError
+      ? `YouTube rejected the API key: ${error.message}`
+      : error?.name === "QuotaExceededError"
+        ? "Browser storage is full. Delete local data and refresh again."
+        : `Refresh failed: ${error?.message || error}`;
+    state.localRefresh = { running: false, done: 0, total: 0, error: reason };
+  }
+  if (playerIsOpen()) return;
+  render();
+}
+
+async function importSubscriptionsFile(file) {
+  if (!file) return;
+  const subscriptions = parseSubscriptionsCsv(await file.text());
+  if (!subscriptions.length) {
+    state.localRefresh.error = "No channels found. Use subscriptions.csv from Google Takeout (Channel ID, Channel URL, Channel title).";
+    render();
+    return;
+  }
+  localStorage.setItem(SUBSCRIPTIONS_KEY, JSON.stringify(subscriptions));
+  state.localRefresh.error = "";
+  if (!isLocalMode()) applyFeed(emptyLocalFeed());
+  render();
+}
+
+function saveLocalApiKey() {
+  const input = document.querySelector("#localApiKey");
+  const value = input?.value.trim() || "";
+  if (!value) return;
+  localStorage.setItem(API_KEY_KEY, value);
+  state.localRefresh.error = "";
+  render();
+}
+
+function clearLocalSources() {
+  if (!window.confirm("Delete your API key, subscriptions, and local feed from this browser?")) return;
+  [API_KEY_KEY, SUBSCRIPTIONS_KEY, LOCAL_FEED_KEY].forEach((key) => localStorage.removeItem(key));
+  state.localRefresh = { running: false, done: 0, total: 0, error: "" };
+  applyFeed(emptyLocalFeed());
+  render();
+}
+
+function localSourcesCard() {
+  const apiKey = localStorage.getItem(API_KEY_KEY) || "";
+  const subscriptions = storedSubscriptions();
+  const failures = isLocalMode() ? state.feed?.health?.failures || [] : [];
+  return `
+      <article class="settings-card local-sources" id="localSources">
+        <div class="manager-heading"><div><p class="eyebrow">Private to this browser</p><h2>My sources</h2></div></div>
+        <p>Your API key, subscriptions, and feed are stored only in this browser. Nothing is sent to GitHub.</p>
+        <div class="local-source-row">
+          <label class="local-source-field"><span>YouTube Data API key</span><input id="localApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="${apiKey ? `Saved key ending in ${escapeHtml(apiKey.slice(-4))}` : "AIza…"}"></label>
+          <button id="saveLocalApiKey" class="action-button" type="button">Save key</button>
+        </div>
+        <div class="local-source-row">
+          <button id="uploadSubscriptions" class="action-button" type="button">Upload subscriptions.csv</button>
+          <span>${subscriptions.length ? `${subscriptions.length} channels` : "No subscriptions yet"}</span>
+          <input id="subscriptionsFile" type="file" accept=".csv,text/csv" hidden>
+        </div>
+        ${subscriptions.length ? `<details class="local-channel-list"><summary>Show channels</summary><ul>${subscriptions.map((subscription) => `<li>${escapeHtml(subscription.title)}</li>`).join("")}</ul></details>` : ""}
+        <div class="apply-settings-bar">
+          <div><strong>Feed refresh</strong><span id="localRefreshStatus">${escapeHtml(localRefreshStatusText())}</span></div>
+          <button id="refreshLocalFeed" class="apply-settings" type="button" ${state.localRefresh.running ? "disabled" : ""}>Refresh feed</button>
+        </div>
+        ${failures.length ? `<details class="local-channel-list"><summary>${failures.length} channel(s) failed on the last refresh</summary><ul>${failures.map((failure) => `<li>${escapeHtml(failure.channel)}: ${escapeHtml(failure.message)}</li>`).join("")}</ul></details>` : ""}
+        <div class="settings-actions"><button id="clearLocalData" class="danger" type="button">Delete local sources and feed</button></div>
+      </article>`;
+}
+
+function localOnboardingView() {
+  return `
+    <section class="settings">
+      <div class="settings-hero">
+        <p class="eyebrow">Welcome</p>
+        <h1>Build your feed from your own subscriptions</h1>
+        <p>Add a YouTube Data API key and upload subscriptions.csv from Google Takeout. Everything stays in this browser.</p>
+      </div>
+      ${localSourcesCard()}
+    </section>`;
 }
 
 function toggleSidebar() {
@@ -2780,7 +2969,7 @@ scrim.addEventListener("click", () => {
   scrim.classList.remove("open");
 });
 document.querySelector("#brandButton").addEventListener("click", goHome);
-document.querySelector("#refreshButton").addEventListener("click", loadFeed);
+document.querySelector("#refreshButton").addEventListener("click", () => (isLocalMode() ? runLocalRefresh() : loadFeed()));
 document.querySelector("#themeButton").addEventListener("click", (event) => {
   state.theme = state.theme === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = state.theme;
@@ -2959,6 +3148,10 @@ app.addEventListener("click", (event) => {
     applyFeedSettings();
     return;
   }
+  if (event.target.closest("#saveLocalApiKey")) return saveLocalApiKey();
+  if (event.target.closest("#uploadSubscriptions")) return document.querySelector("#subscriptionsFile")?.click();
+  if (event.target.closest("#refreshLocalFeed")) return runLocalRefresh();
+  if (event.target.closest("#clearLocalData")) return clearLocalSources();
   if (event.target.closest("#exportHistory")) exportHistory();
   if (event.target.closest("#exportLiked")) exportLiked();
   if (event.target.closest("#importHistory")) document.querySelector("#historyFile")?.click();
@@ -3007,6 +3200,10 @@ app.addEventListener("change", (event) => {
   if (event.target.id === "autoplayToggle") {
     state.autoplay = event.target.checked;
     localStorage.setItem(AUTOPLAY_KEY, String(state.autoplay));
+  }
+  if (event.target.id === "subscriptionsFile") {
+    importSubscriptionsFile(event.target.files?.[0]).catch(() => window.alert("The selected subscriptions file could not be read."));
+    return;
   }
   if (event.target.id === "historyFile") {
     importHistory(event.target.files?.[0]).catch(() => window.alert("The selected history JSON could not be imported."));

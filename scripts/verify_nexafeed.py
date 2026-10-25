@@ -51,6 +51,7 @@ required_files = [
     "short-history.mjs",
     "video-actions.mjs",
     "daily-archive.mjs",
+    "local-feed.mjs",
     "float.html",
     "config.json",
     ".env.example",
@@ -293,8 +294,11 @@ for workflow_name, workflow in {
     "apply-feed-settings.yml": settings_workflow,
     "update-feed.yml": update_workflow,
 }.items():
-    if "daily-archive.mjs" not in workflow:
-        fail(f"{workflow_name} deployment artifact omits daily-archive.mjs")
+    for module in ["daily-archive.mjs", "local-feed.mjs"]:
+        if module not in workflow:
+            fail(f"{workflow_name} deployment artifact omits {module}")
+    if "_site/data" in workflow:
+        fail(f"{workflow_name} must not publish feed data to Pages")
     for match in re.finditer(r"uses:\s+([^\s#]+)", workflow):
         if not re.search(r"@[0-9a-f]{40}$", match.group(1)):
             fail(f"{workflow_name} action is not SHA pinned: {match.group(1)}")
